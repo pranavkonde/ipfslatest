@@ -1,0 +1,39 @@
+{
+  "name": "ipfs-file-storage-dapp",
+  "version": "1.0.0",
+  "description": "Decentralized file storage dApp on Rootstock with IPFS integration",
+  "scripts": {
+    "setup": "./quick-start.sh",
+    "build:contracts": "cd contracts && forge build",
+    "test:contracts": "cd contracts && forge test",
+    "deploy:local": "cd contracts && forge script script/Deploy.s.sol:DeployScript --rpc-url http://localhost:8545 --broadcast",
+    "deploy:testnet": "cd contracts && forge script script/Deploy.s.sol:DeployScript --rpc-url https://public-node.testnet.rsk.co --broadcast --verify",
+    "deploy:mainnet": "cd contracts && forge script script/Deploy.s.sol:DeployScript --rpc-url https://public-node.rsk.co --broadcast --verify",
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm start",
+    "lint": "cd frontend && npm run lint",
+    "install:frontend": "cd frontend && npm install",
+    "install:contracts": "cd contracts && forge install"
+  },
+  "keywords": [
+    "ipfs",
+    "rootstock",
+    "blockchain",
+    "decentralized",
+    "file-storage",
+    "dapp",
+    "ethereum",
+    "smart-contracts"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/ipfs-file-storage-dapp.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
