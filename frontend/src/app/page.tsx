@@ -1,118 +1,292 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
-import FileUpload from '@/components/FileUpload';
-import FileList from '@/components/FileList';
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract } from 'wagmi';
+import axios from 'axios';
+
+// Contract ABI (minimal required functions)
+const ABI = [
+  {
+    name: 'uploadFile',
+    type: 'function',
+    inputs: [
+      { name: '_ipfsHash', type: 'string' },
+      { name: '_fileName', type: 'string' },
+      { name: '_fileSize', type: 'uint256' }
+    ]
+  },
+  {
+    name: 'deleteFile',
+    type: 'function',
+    inputs: [{ name: '_fileId', type: 'uint256' }]
+  },
+  {
+    name: 'getUserFiles',
+    type: 'function',
+    inputs: [{ name: '_user', type: 'address' }],
+    outputs: [{ type: 'uint256[]' }],
+    stateMutability: 'view'
+  },
+  {
+    name: 'getFiles',
+    type: 'function',
+    inputs: [{ name: '_fileIds', type: 'uint256[]' }],
+    outputs: [{
+      type: 'tuple[]',
+      components: [
+        { name: 'ipfsHash', type: 'string' },
+        { name: 'fileName', type: 'string' },
+        { name: 'fileSize', type: 'uint256' },
+        { name: 'uploader', type: 'address' },
+        { name: 'timestamp', type: 'uint256' },
+        { name: 'exists', type: 'bool' }
+      ]
+    }],
+    stateMutability: 'view'
+  }
+] as const;
+
+const CONTRACT_ADDRESS = '0xd3Fd10c95353F154AEA89DdF93a2fdF0a035bFd3' as const;
+const PINATA_GATEWAY = process.env.NEXT_PUBLIC_PINATA_GATEWAY || 'https://gateway.pinata.cloud';
+
+// Utility functions
+const formatFileSize = (bytes: number): string => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+const formatDate = (timestamp: bigint): string => {
+  return new Date(Number(timestamp) * 1000).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
+// IPFS upload function
+const uploadToIPFS = async (
+  file: File,
+  onProgress?: (percentage: number) => void
+): Promise<string> => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('pinataMetadata', JSON.stringify({ name: file.name }));
+  formData.append('pinataOptions', JSON.stringify({ cidVersion: 0 }));
+
+  const response = await axios.post(
+    'https://api.pinata.cloud/pinning/pinFileToIPFS',
+    formData,
+    {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        pinata_api_key: process.env.NEXT_PUBLIC_PINATA_API_KEY!,
+        pinata_secret_api_key: process.env.NEXT_PUBLIC_PINATA_SECRET_KEY!,
+      },
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          onProgress(Math.round((progressEvent.loaded * 100) / progressEvent.total));
+        }
+      },
+    }
+  );
+  return response.data.IpfsHash;
+};
 
 export default function Home() {
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const { address, isConnected } = useAccount();
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [isUploading, setIsUploading] = useState(false);
+  const [userFiles, setUserFiles] = useState<any[]>([]);
+  const [error, setError] = useState<string>('');
 
-  const handleUploadSuccess = () => {
-    setRefreshTrigger(prev => prev + 1);
+  // Upload contract interaction
+  const { writeContract: uploadFile, data: uploadHash, isPending: isUploadPending } = useWriteContract();
+  const { isLoading: isUploadConfirming, isSuccess: uploadSuccess } = useWaitForTransactionReceipt({ hash: uploadHash });
+
+  // Delete contract interaction
+  const { writeContract: deleteFile, data: deleteHash, isPending: isDeletePending } = useWriteContract();
+  const { isLoading: isDeleteConfirming } = useWaitForTransactionReceipt({ hash: deleteHash });
+
+  // Read user files
+  const { data: fileIds, refetch: refetchFileIds } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: ABI,
+    functionName: 'getUserFiles',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address }
+  });
+
+  const { data: filesData, refetch: refetchFiles } = useReadContract({
+    address: CONTRACT_ADDRESS,
+    abi: ABI,
+    functionName: 'getFiles',
+    args: fileIds ? [fileIds] : undefined,
+    query: { enabled: !!fileIds && (fileIds as any[]).length > 0 }
+  });
+
+  // Update files list
+  useEffect(() => {
+    if (filesData && Array.isArray(filesData)) {
+      setUserFiles(filesData.filter((file: any) => file.exists));
+    }
+  }, [filesData]);
+
+  // Refresh after upload success
+  useEffect(() => {
+    if (uploadSuccess) {
+      refetchFileIds();
+      refetchFiles();
+      setSelectedFile(null);
+      setUploadProgress(0);
+    }
+  }, [uploadSuccess, refetchFileIds, refetchFiles]);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      if (file.size > 100 * 1024 * 1024) {
+        setError('File size exceeds 100MB limit');
+        return;
+      }
+      setSelectedFile(file);
+      setError('');
+    }
+  };
+
+  const handleUpload = async () => {
+    if (!selectedFile || !isConnected) return;
+    
+    try {
+      setIsUploading(true);
+      setError('');
+      
+      // Upload to IPFS
+      const ipfsHash = await uploadToIPFS(selectedFile, setUploadProgress);
+      
+      // Store on blockchain
+      uploadFile({
+        address: CONTRACT_ADDRESS,
+        abi: ABI,
+        functionName: 'uploadFile',
+        args: [ipfsHash, selectedFile.name, BigInt(selectedFile.size)],
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleDelete = (fileId: number) => {
+    deleteFile({
+      address: CONTRACT_ADDRESS,
+      abi: ABI,
+      functionName: 'deleteFile',
+      args: [BigInt(fileId)],
+    });
   };
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div>
       {/* Header */}
-      <header className="bg-white shadow-sm border-b">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center h-16">
-            <div className="flex items-center">
-              <h1 className="text-2xl font-bold text-gray-900">
-                IPFS File Storage dApp
-              </h1>
-              <span className="ml-3 px-2 py-1 text-xs font-medium bg-blue-100 text-blue-800 rounded-full">
-                Rootstock Testnet
-              </span>
-            </div>
-            <ConnectButton />
-          </div>
-        </div>
+      <header>
+        <h1>IPFS Storage dApp</h1>
+        <ConnectButton />
       </header>
 
+      <hr />
+
       {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="mb-8">
-          <h2 className="text-3xl font-bold text-gray-900 mb-4">
-            Decentralized File Storage
-          </h2>
-          <p className="text-lg text-gray-600 max-w-3xl">
-            Upload your files to IPFS and store the hash on the Rootstock testnet blockchain. 
-            Your files are decentralized, immutable, and accessible from anywhere in the world.
-          </p>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* Upload Section */}
+      <main>
+        {!isConnected ? (
           <div>
-            <FileUpload onUploadSuccess={handleUploadSuccess} />
+            <h2>Connect Your Wallet</h2>
+            <p>Please connect your wallet to start using the dApp</p>
+            <ConnectButton />
           </div>
-
-          {/* File List Section */}
+        ) : (
           <div>
-            <FileList refreshTrigger={refreshTrigger} />
-          </div>
-        </div>
+            {/* Upload Section */}
+            <div>
+              <h2>Upload File</h2>
+              
+              <input
+                type="file"
+                onChange={handleFileSelect}
+                disabled={isUploading || isUploadPending || isUploadConfirming}
+              />
 
-        {/* Features Section */}
-        <div className="mt-16">
-          <h3 className="text-2xl font-bold text-gray-900 mb-8 text-center">
-            Why Choose Our dApp?
-          </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-            <div className="text-center">
-              <div className="bg-blue-100 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
-                <svg className="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                </svg>
-              </div>
-              <h4 className="text-lg font-semibold text-gray-900 mb-2">Secure & Decentralized</h4>
-              <p className="text-gray-600">
-                Your files are stored on IPFS, a peer-to-peer network, making them highly available and censorship-resistant.
-              </p>
+              {selectedFile && (
+                <div>
+                  <p><b>Name:</b> {selectedFile.name}</p>
+                  <p><b>Size:</b> {formatFileSize(selectedFile.size)}</p>
+                </div>
+              )}
+
+              {uploadProgress > 0 && uploadProgress < 100 && (
+                <div>
+                  <p>Uploading: {uploadProgress}%</p>
+                </div>
+              )}
+
+              {error && <p style={{color: 'red'}}>{error}</p>}
+              {uploadSuccess && <p style={{color: 'green'}}>File uploaded successfully!</p>}
+
+              <button
+                onClick={handleUpload}
+                disabled={!selectedFile || isUploading || isUploadPending || isUploadConfirming}
+              >
+                {isUploading ? 'Uploading to IPFS...' : 
+                 isUploadPending ? 'Confirm Transaction...' :
+                 isUploadConfirming ? 'Confirming...' : 
+                 'Upload File'}
+              </button>
             </div>
-            
-            <div className="text-center">
-              <div className="bg-green-100 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
-                <svg className="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-              </div>
-              <h4 className="text-lg font-semibold text-gray-900 mb-2">Immutable Records</h4>
-              <p className="text-gray-600">
-                File hashes are stored on the Rootstock testnet blockchain, creating an immutable record of your uploads.
-              </p>
-            </div>
-            
-            <div className="text-center">
-              <div className="bg-purple-100 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
-                <svg className="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-              </div>
-              <h4 className="text-lg font-semibold text-gray-900 mb-2">Fast & Efficient</h4>
-              <p className="text-gray-600">
-                Built on Rootstock for fast transactions and low fees, powered by Bitcoin&apos;s security.
-              </p>
+
+            <hr />
+
+            {/* Files List */}
+            <div>
+              <h2>Your Files ({userFiles.length})</h2>
+
+              {userFiles.length === 0 ? (
+                <p>No files uploaded yet</p>
+              ) : (
+                <div>
+                  {userFiles.map((file, index) => (
+                    <div key={index} style={{marginBottom: '20px', borderBottom: '1px solid #ccc', paddingBottom: '10px'}}>
+                      <p><b>{file.fileName}</b></p>
+                      <p>{formatFileSize(Number(file.fileSize))} • {formatDate(file.timestamp)}</p>
+                      <p>IPFS: {file.ipfsHash}</p>
+                      <a
+                        href={`${PINATA_GATEWAY}/ipfs/${file.ipfsHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        View File
+                      </a>
+                      {' | '}
+                      <button
+                        onClick={() => handleDelete(index)}
+                        disabled={isDeletePending || isDeleteConfirming}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
-        </div>
+        )}
       </main>
-
-      {/* Footer */}
-      <footer className="bg-white border-t mt-16">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <div className="text-center text-gray-600">
-            <p>
-              Built with ❤️ using Next.js, Wagmi, RainbowKit, and Foundry
-            </p>
-            <p className="mt-2 text-sm">
-              Powered by IPFS and Rootstock testnet blockchain
-            </p>
-          </div>
-        </div>
-      </footer>
     </div>
   );
 }
